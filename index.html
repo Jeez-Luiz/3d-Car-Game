@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>3D Driving Game — Three.js + cannon-es</title>
+  <style>
+    html,body{height:100%;margin:0;background:#111;color:#eee;font-family:Inter,system-ui,Arial}
+    #app{height:100%;display:flex;flex-direction:column}
+    canvas{display:block;}
+    .overlay{
+      position: absolute;left:12px;top:12px;z-index:10;background:rgba(0,0,0,0.45);backdrop-filter:blur(6px);padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.04)
+    }
+    .hud{position: absolute;right:12px;top:12px;z-index:10;background:rgba(0,0,0,0.45);padding:10px;border-radius:8px;min-width:110px;text-align:center}
+    .btn{display:inline-block;padding:6px 10px;margin:6px 4px;border-radius:6px;background:#1f6feb;color:white;text-decoration:none;cursor:pointer;border:0}
+    .small{font-size:12px;color:#bbb}
+    #loading{position: absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,0.6);padding:18px;border-radius:8px}
+    #map{position:absolute;left:12px;bottom:12px;z-index:10;background:rgba(0,0,0,0.45);padding:6px;border-radius:6px}
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="container"></div>
+  <div class="overlay" id="controls">
+    <div style="font-weight:700">Controls</div>
+    <div class="small">W / ↑ : accelerate · S / ↓ : brake / reverse</div>
+    <div class="small">A / ← · D / → : steer · Space : handbrake</div>
+    <div style="margin-top:8px;"><button id="resetBtn" class="btn">Reset</button><button id="toggleCamera" class="btn">Toggle Camera</button></div>
+  </div>
+  <div class="hud" id="hud">
+    <div style="font-weight:700">Speed</div>
+    <div id="speed" style="font-size:20px;">0 km/h</div>
+    <div class="small" style="margin-top:8px">Gear: <span id="gear">1</span></div>
+  </div>
+  <div id="map" class="small">Model: concept_sport_car.glb</div>
+  <div id="loading">Loading assets... <span id="prog">0%</span></div>
+</div>
+
+<script type="module">
+import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+import { GLTFLoader } from 'https://unpkg.com/three@0.158.0/examples/jsm/loaders/GLTFLoader.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.158.0/examples/jsm/controls/OrbitControls.js';
+import { GUI } from 'https://unpkg.com/three@0.158.0/examples/jsm/libs/lil-gui.module.min.js';
+import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.module.js';
+
+// Raw URL for the GLB on GitHub. If this 404s, make sure the repository/file is public and path exact.
+const MODEL_URL = 'https://raw.githubusercontent.com/Jeez-Luiz/3d-Car-Game/main/concept_sport_car.glb';
+
+// Basic three.js setup
+const container = document.getElementById('container');
+const loadingEl = document.getElementById('loading');
+const progEl = document.getElementById('prog');
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x8fbbe3);
+
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+container.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.1, 1000);
+camera.position.set(0, 6, -12);
+
+const followCamera = new THREE.Object3D();
+followCamera.position.set(0,3, -8);
+
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.enableDamping = true;
+orbit.enabled = false; // start with gameplay camera
+
+// Lights
+const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.7);
+hemi.position.set(0,50,0);
+scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+dir.position.set(-10,20,10);
+dir.castShadow = true;
+dir.shadow.camera.left = -30;
+dir.shadow.camera.right = 30;
+dir.shadow.camera.top = 30;
+dir.shadow.camera.bottom = -30;
+dir.shadow.mapSize.set(2048,2048);
+scene.add(dir);
+
+// Ground
+const groundGeo = new THREE.PlaneGeometry(200,200);
+const groundMat = new THREE.MeshStandardMaterial({color:0x2b2b2b, metalness:0.1, roughness:0.9});
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI/2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// CANNON physics world
+const world = new CANNON.World({gravity: new CANNON.Vec3(0,-9.82,0)});
+world.broadphase = new CANNON.SAPBroadphase(world);
+world.solver.iterations = 10;
+
+// ground body
+const groundBody = new CANNON.Body({ mass:0, shape: new CANNON.Plane(), material: new CANNON.Material({friction:0.6, restitution:0.0}) });
+groundBody.quaternion.setFromEuler(-Math.PI/2, 0, 0);
+world.addBody(groundBody);
+
+// Simple environment objects
+function spawnBox(x,z,w=2,h=2,d=2,color=0x6b6b6b){
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), new THREE.MeshStandardMaterial({color}));
+  m.position.set(x, h/2, z);
+  m.castShadow = true; m.receiveShadow = true;
+  scene.add(m);
+  const b = new CANNON.Body({mass:0, shape:new CANNON.Box(new CANNON.Vec3(w/2,h/2,d/2))});
+  b.position.set(x, h/2, z);
+  world.addBody(b);
+}
+
+for(let i=0;i<30;i++){
+  spawnBox((Math.random()-0.5)*80, (Math.random()-0.5)*80, 2+Math.random()*4,2+Math.random()*6, 2+Math.random()*4, 0x444444);
+}
+
+// Variables for vehicle
+let vehicle, chassisBody, wheelBodies = [];
+let vehicleMesh = new THREE.Group();
+scene.add(vehicleMesh);
+
+// Load car model
+const loader = new GLTFLoader();
+let chassisVisual;
+loader.load(MODEL_URL, (gltf)=>{
+  progEl.textContent = '100%';
+  loadingEl.style.display = 'none';
+  const car = gltf.scene || gltf.scenes[0];
+  car.traverse((c)=>{ if(c.isMesh){ c.castShadow = true; c.receiveShadow = true; } });
+  // scale and center
+  car.scale.setScalar(0.9);
+  car.rotation.y = Math.PI; // orientation fix
+  chassisVisual = car;
+  // We'll attach the GLTF to the chassis mesh once physics is ready
+  initVehicle();
+}, (xhr)=>{
+  if(xhr.total) progEl.textContent = Math.round((xhr.loaded/xhr.total)*100) + '%';
+}, (err)=>{
+  console.error('GLTF load error', err);
+  loadingEl.textContent = 'Failed to load model. Check the file URL in the source.';
+});
+
+// Vehicle init using cannon-es RaycastVehicle
+function initVehicle(){
+  // chassis physics body — a box approximation
+  const chassisShape = new CANNON.Box(new CANNON.Vec3(1.1,0.5,2.4));
+  chassisBody = new CANNON.Body({ mass: 150 });
+  chassisBody.addShape(chassisShape);
+  chassisBody.position.set(0,4,0);
+  chassisBody.angularDamping = 0.4;
+  world.addBody(chassisBody);
+
+  // visual chassis placeholder
+  const chassisBox = new THREE.Mesh(new THREE.BoxGeometry(2.2,1.0,4.8), new THREE.MeshStandardMaterial({color:0x111111,transparent:true,opacity:0.0}));
+  chassisBox.visible = false; // hide the proxy
+  vehicleMesh.add(chassisBox);
+
+  // attach GLTF model if available
+  if(chassisVisual){
+    chassisVisual.position.set(0,0,0);
+    chassisVisual.scale.setScalar(1.0);
+    vehicleMesh.add(chassisVisual);
+  }
+
+  // Create the vehicle
+  vehicle = new CANNON.RaycastVehicle({ chassisBody: chassisBody, indexRightAxis: 0, indexUpAxis: 1, indexForwardAxis: 2 });
+
+  const axleWidth = 1.1; // spacing
+  const wheelOptions = {
+    radius: 0.4,
+    directionLocal: new CANNON.Vec3(0,-1,0),
+    suspensionStiffness: 30,
+    suspensionRestLength: 0.3,
+    suspensionDamping: 2.3,
+    maxSuspensionForce: 100000,
+    frictionSlip: 4,
+    rollInfluence: 0.01,
+    axleLocal: new CANNON.Vec3(1,0,0),
+    chassisConnectionPointLocal: new CANNON.Vec3(),
+    maxSuspensionTravel: 0.3,
+    customSlidingRotationalSpeed: -30,
+    useCustomSlidingRotationalSpeed: true
+  };
+
+  // Front-left
+  wheelOptions.chassisConnectionPointLocal.set(-axleWidth,0.3,1.5);
+  vehicle.addWheel(wheelOptions);
+  // Front-right
+  wheelOptions.chassisConnectionPointLocal.set(axleWidth,0.3,1.5);
+  vehicle.addWheel(wheelOptions);
+  // Back-left
+  wheelOptions.chassisConnectionPointLocal.set(-axleWidth,0.3,-1.6);
+  vehicle.addWheel(wheelOptions);
+  // Back-right
+  wheelOptions.chassisConnectionPointLocal.set(axleWidth,0.3,-1.6);
+  vehicle.addWheel(wheelOptions);
+
+  // Create wheel visuals and wheel bodies (only for visual; RaycastVehicle handles collision)
+  const wheelGeo = new THREE.CylinderGeometry(wheelOptions.radius, wheelOptions.radius, 0.4, 24);
+  const wheelMat = new THREE.MeshStandardMaterial({metalness:0.2, roughness:0.8});
+
+  vehicle.wheelInfos.forEach((wheel)=>{
+    const wheelMesh = new THREE.Mesh(wheelGeo, wheelMat);
+    wheelMesh.rotation.z = Math.PI/2;
+    wheelMesh.castShadow = true;
+    wheelMesh.receiveShadow = true;
+    vehicleMesh.add(wheelMesh);
+    wheelBodies.push(wheelMesh);
+  });
+
+  vehicle.addToWorld(world);
+
+  // keyboard controls
+  setupControls();
+}
+
+// Controls
+const keys = {forward:false, back:false, left:false, right:false, brake:false};
+let maxForce = 3000;
+let maxSteerVal = 0.6; // radians
+function setupControls(){
+  window.addEventListener('keydown', (e)=>{
+    switch(e.code){
+      case 'ArrowUp': case 'KeyW': keys.forward = true; break;
+      case 'ArrowDown': case 'KeyS': keys.back = true; break;
+      case 'ArrowLeft': case 'KeyA': keys.left = true; break;
+      case 'ArrowRight': case 'KeyD': keys.right = true; break;
+      case 'Space': keys.brake = true; break;
+    }
+  });
+  window.addEventListener('keyup', (e)=>{
+    switch(e.code){
+      case 'ArrowUp': case 'KeyW': keys.forward = false; break;
+      case 'ArrowDown': case 'KeyS': keys.back = false; break;
+      case 'ArrowLeft': case 'KeyA': keys.left = false; break;
+      case 'ArrowRight': case 'KeyD': keys.right = false; break;
+      case 'Space': keys.brake = false; break;
+    }
+  });
+
+  document.getElementById('resetBtn').addEventListener('click', ()=>{
+    resetCar();
+  });
+  document.getElementById('toggleCamera').addEventListener('click', ()=>{
+    orbit.enabled = !orbit.enabled;
+  });
+}
+
+function resetCar(){
+  if(!chassisBody) return;
+  chassisBody.position.set(0,4,0);
+  chassisBody.quaternion.set(0,0,0,1);
+  chassisBody.velocity.set(0,0,0);
+  chassisBody.angularVelocity.set(0,0,0);
+}
+
+// HUD update
+function updateHUD(){
+  const speed = chassisBody ? chassisBody.velocity.length() * 3.6 : 0; // m/s -> km/h
+  document.getElementById('speed').textContent = Math.round(speed) + ' km/h';
+  const gearEl = document.getElementById('gear');
+  const gear = speed < 1 ? 'N' : speed < 30 ? '1' : speed < 70 ? '2' : '3';
+  gearEl.textContent = gear;
+}
+
+// Animation loop
+let lastTime;
+function animate(time){
+  requestAnimationFrame(animate);
+  const dt = Math.min((time - (lastTime||time))/1000, 1/30);
+  lastTime = time;
+
+  // handle controls
+  if(vehicle){
+    // engine force
+    let engineForce = 0;
+    if(keys.forward) engineForce = -maxForce;
+    if(keys.back) engineForce = maxForce*0.5;
+    // apply to rear wheels (2,3)
+    vehicle.applyEngineForce(engineForce, 2);
+    vehicle.applyEngineForce(engineForce, 3);
+
+    // braking
+    const brakeForce = keys.brake ? 100 : 0;
+    for(let i=0;i<vehicle.wheelInfos.length;i++) vehicle.setBrake(brakeForce, i);
+
+    // steering
+    const steer = (keys.left?1:0) - (keys.right?1:0);
+    vehicle.setSteeringValue( maxSteerVal * steer, 0 );
+    vehicle.setSteeringValue( maxSteerVal * steer, 1 );
+  }
+
+  // step world
+  world.step(1/60, dt, 3);
+
+  // sync visuals
+  if(chassisBody){
+    // update vehicleMesh position to chassisBody
+    vehicleMesh.position.copy(chassisBody.position);
+    vehicleMesh.quaternion.copy(chassisBody.quaternion);
+
+    // update wheel visuals
+    for(let i=0;i<vehicle.wheelInfos.length;i++){
+      vehicle.updateWheelTransform(i);
+      const t = vehicle.wheelInfos[i].worldTransform;
+      const wm = wheelBodies[i];
+      wm.position.set(t.position.x, t.position.y, t.position.z);
+      wm.quaternion.set(t.quaternion.x, t.quaternion.y, t.quaternion.z, t.quaternion.w);
+    }
+  }
+
+  // camera follow
+  if(!orbit.enabled){
+    // place camera behind the car
+    const worldPos = new THREE.Vector3();
+    vehicleMesh.getWorldPosition(worldPos);
+    const chassisQuat = new THREE.Quaternion();
+    vehicleMesh.getWorldQuaternion(chassisQuat);
+    const localCamPos = new THREE.Vector3(0,3, -8);
+    localCamPos.applyQuaternion(chassisQuat);
+    camera.position.lerp(new THREE.Vector3().addVectors(worldPos, localCamPos), 0.08);
+    const lookAt = new THREE.Vector3().addVectors(worldPos, new THREE.Vector3(0,1.5,0));
+    camera.lookAt(lookAt);
+  } else {
+    orbit.update();
+  }
+
+  updateHUD();
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(animate);
+
+// resize
+window.addEventListener('resize', ()=>{
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// Simple GUI (optional tuning)
+const gui = new GUI({width:260});
+const physicsFolder = gui.addFolder('Physics tuning');
+physicsFolder.add(window, 'maxForce', 500, 8000).name('Max Force');
+physicsFolder.add(window, 'maxSteerVal', 0.1, 1.2).name('Max steer (rad)');
+physicsFolder.open();
+
+// Helpful note in console
+console.log('Driving game loaded. Use W/A/S/D or arrow keys. Reset button resets car.');
+</script>
+</body>
+</html>
